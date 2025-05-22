@@ -119,8 +119,8 @@ fn try_flake_attr(
     nix_options: &NixOptions,
     system: &str,
 ) -> Result<Option<String>> {
-    let try_flake_attr_impl = |attr: &str| {
-        let full_uri = format!("{flake}#{FLAKE_ATTR}.{attr}");
+    let try_flake_attr_impl = |attr: &str| -> Result<Option<String>> {
+        let full_uri = format!("{flake}#{attr}");
         log::info!("Trying flake URI: {full_uri}...");
         let status = try_nix_eval(flake, attr, nix_options)?;
         if status {
@@ -131,12 +131,17 @@ fn try_flake_attr(
             Ok(None)
         }
     };
-    if let Some(result) = try_flake_attr_impl(&format!("{system}.{attr}"))? {
-        Ok(Some(result))
-    } else {
-        let attr = attr.strip_prefix(&format!("{FLAKE_ATTR}.")).unwrap_or(attr);
-        try_flake_attr_impl(attr)
+    let attrs_to_try = [
+        &format!("{FLAKE_ATTR}.{system}.{attr}"),
+        &format!("{FLAKE_ATTR}.{attr}"),
+        attr,
+    ];
+    for attrs in attrs_to_try {
+        if let Some(result) = try_flake_attr_impl(attrs)? {
+            return Ok(Some(result));
+        }
     }
+    Ok(None)
 }
 
 fn get_store_path(nix_build_result: process::Output) -> Result<StorePath> {
@@ -180,9 +185,19 @@ fn run_nix_build(flake_uri: &str, nix_options: &NixOptions) -> Result<process::O
 
 fn try_nix_eval(flake: &str, attr: &str, nix_options: &NixOptions) -> Result<bool> {
     let mut cmd = nix_cmd(nix_options);
+    let flake = if std::path::Path::is_absolute(flake.as_ref()) {
+        flake
+    } else {
+        let cwd = std::env::current_dir()?;
+        let cwd = cwd
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Non-unicode path to CWD"))?;
+        &format!("{cwd}/{flake}")
+    };
     cmd.arg("eval")
-        .arg(format!("{flake}#{FLAKE_ATTR}"))
-        .arg("--json")
+        .arg("--impure")
+        .arg("--expr")
+        .arg(format!("builtins.getFlake \"{flake}\""))
         .arg("--apply")
         .arg(format!("_: _ ? {attr}"));
 
@@ -233,13 +248,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_try_nix_eval() {
+    fn test_try_flake_attr() {
         let flake = "./test/rust/register";
         let nix_options = &NixOptions::new(vec![]);
 
-        assert!(try_nix_eval(flake, "identifier-key", nix_options).unwrap());
-        assert!(try_nix_eval(flake, "\"string.literal/key\"", nix_options).unwrap());
-        assert!(!try_nix_eval(flake, "_identifier-key", nix_options).unwrap());
-        assert!(!try_nix_eval(flake, "\"_string.literal/key\"", nix_options).unwrap());
+        let system = "x86_64-linux"; // irrelevant
+
+        macro_rules! check {
+            ($key:literal, $prefixed:literal, $exists:literal) => {
+                let key = $key;
+                let prefix = if $prefixed { "" } else { "systemConfigs." };
+                assert_eq!(
+                    try_flake_attr(flake, key, nix_options, system).unwrap(),
+                    $exists.then_some(format!("./test/rust/register#{prefix}{key}")),
+                );
+            };
+        }
+
+        check!("systemConfigs.identifier-key", true, true);
+        check!("identifier-key", false, true);
+        check!("systemConfigs.\"string.literal/key\"", true, true);
+        check!("\"string.literal/key\"", false, true);
+
+        check!("systemConfigs._identifier-key", true, false);
+        check!("_identifier-key", false, false);
+        check!("systemConfigs.\"_string.literal/key\"", true, false);
+        check!("\"_string.literal/key\"", false, false);
     }
 }
